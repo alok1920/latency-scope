@@ -106,3 +106,22 @@ def rate_quality(stats: LatencyStats) -> tuple[str, int]:
     jit_pen = min(jit, 20.0)                # 20ms+ jitter -> 20 pts off
     score = int(max(0.0, 100.0 - lat_pen - loss_pen - jit_pen))
     return label_out, score
+
+
+# Route-status thresholds for the live dashboard.
+RTT_WARN_MS = 130.0
+LOSS_WARN_PCT = 5.0
+
+
+def route_status(stats: LatencyStats) -> tuple[str, str]:
+    """Classify a live route as ``(message, severity)``.
+
+    ``severity`` is one of ``"optimal"``, ``"warning"`` or ``"critical"``.
+    A route is a warning when average RTT exceeds :data:`RTT_WARN_MS` or packet
+    loss reaches :data:`LOSS_WARN_PCT`; otherwise it is optimal.
+    """
+    if stats.received == 0:
+        return "NO ROUTE — ENDPOINT UNREACHABLE", "critical"
+    if stats.loss_pct >= LOSS_WARN_PCT or (stats.avg_ms is not None and stats.avg_ms > RTT_WARN_MS):
+        return "WARNING — HIGH LATENCY / PACKET LOSS", "warning"
+    return "OPTIMAL ROUTE", "optimal"

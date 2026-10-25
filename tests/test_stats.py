@@ -1,4 +1,9 @@
-from latencyscope.core.stats import compute_stats, rate_quality
+from latencyscope.core.stats import (
+    RTT_WARN_MS,
+    compute_stats,
+    rate_quality,
+    route_status,
+)
 
 
 def test_empty_samples():
@@ -69,3 +74,32 @@ def test_score_monotonic_with_latency():
     high = compute_stats([200.0] * 10).score
     assert low > high
     assert 0 <= high <= 100 and 0 <= low <= 100
+
+
+def test_route_status_optimal_below_threshold():
+    msg, sev = route_status(compute_stats([40.0] * 10))
+    assert sev == "optimal"
+    assert "OPTIMAL" in msg
+
+
+def test_route_status_warning_above_rtt_threshold():
+    # Average RTT just over 130 ms must trip the warning.
+    msg, sev = route_status(compute_stats([RTT_WARN_MS + 20] * 10))
+    assert sev == "warning"
+
+
+def test_route_status_warning_on_packet_loss():
+    # Low latency but 20% loss is still a warning.
+    _, sev = route_status(compute_stats([20.0, 20.0, 20.0, 20.0, None]))
+    assert sev == "warning"
+
+
+def test_route_status_critical_when_unreachable():
+    _, sev = route_status(compute_stats([None, None, None]))
+    assert sev == "critical"
+
+
+def test_route_status_boundary_exactly_130_is_optimal():
+    # Exactly at the threshold is still optimal (warning is strictly greater).
+    _, sev = route_status(compute_stats([RTT_WARN_MS] * 10))
+    assert sev == "optimal"
