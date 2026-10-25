@@ -1,9 +1,14 @@
-"""Tkinter GUI for LatencyScope — a dark-mode live latency dashboard.
+"""Tkinter GUI for LatencyScope — a dark-themed, multi-screen latency dashboard.
 
-Pick a target region, hit the tracking toggle, and the app continuously probes
-a region-pinned endpoint on a background thread, streaming results to a live
-status label (colour-coded), a metrics strip and a sparkline canvas.
+Structural layout (generic UI patterns, no third-party branding or assets):
 
+  Screen 1  Catalog  — game grid + search; a card opens the region modal.
+  Screen 2  Modal    — centered server-selection dialog listing regions.
+  Screen 3  Boost    — split view: control panel (left) + live telemetry (right),
+                       hooked to LatencyEngine which refreshes once per second.
+
+All network work runs on LatencyEngine's background thread; results reach the UI
+through a queue drained on the Tk main thread, so the window never locks up.
 Tkinter ships with CPython, so the packaged executable needs no third-party GUI
 dependency.
 """
@@ -11,32 +16,49 @@ dependency.
 from __future__ import annotations
 
 import queue
-import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 from . import __app_name__, __version__
-from .core import probes
+from .core.engine import LatencyEngine
 from .core.stats import RTT_WARN_MS, compute_stats, route_status
 
-# Region -> (host, port). These are PUBLIC, region-pinned reference endpoints
-# (AWS S3 regional hostnames that answer on TCP 443), used purely to measure
-# round-trip latency per region. They are not tied to any commercial
-# accelerator; swap them for your own relay/region endpoints as needed.
-REGIONS: dict[str, tuple[str, int]] = {
-    "North America (NA)": ("s3.us-east-1.amazonaws.com", 443),
-    "Europe (EU)": ("s3.eu-west-1.amazonaws.com", 443),
-    "East Asia (ASIA)": ("s3.ap-northeast-1.amazonaws.com", 443),
-    "Southeast Asia (SEA)": ("s3.ap-southeast-1.amazonaws.com", 443),
-    "Oceania (OCE)": ("s3.ap-southeast-2.amazonaws.com", 443),
+# ---------------------------------------------------------------------------
+# Data: regions -> PUBLIC, region-pinned reference endpoints (AWS regional S3
+# hosts that answer on TCP 443, one per geography). These measure real
+# per-region latency and are NOT any game's or commercial accelerator's server
+# list. Swap them for your own relay endpoints as needed.
+# ---------------------------------------------------------------------------
+REGION_ENDPOINTS: dict[str, list[tuple[str, int]]] = {
+    "Hong Kong": [("s3.ap-east-1.amazonaws.com", 443)],
+    "Tokyo": [("s3.ap-northeast-1.amazonaws.com", 443)],
+    "Korea": [("s3.ap-northeast-2.amazonaws.com", 443)],
+    "Singapore": [("s3.ap-southeast-1.amazonaws.com", 443)],
+    "Middle East": [("s3.me-south-1.amazonaws.com", 443)],
+    "North America": [("s3.us-east-1.amazonaws.com", 443)],
 }
 
-# Dark "matrix" palette.
-CANVAS_BG = "#0B111E"   # outer canvas / window background
-WIDGET_BG = "#121A2E"   # internal display widgets
-FG_TEXT = "#E6EDF7"
-FG_MUTED = "#5A6B86"
+# Catalog entries. (title, is_featured) — generic placeholder titles; WARDOGS is
+# a plain text label only (no logo/art), per the no-trademarked-assets rule.
+GAMES: list[tuple[str, bool]] = [
+    ("WARDOGS", True),
+    ("Strike Arena", False),
+    ("Nova Royale", False),
+    ("Pixel Racers", False),
+    ("Shadow Ops", False),
+    ("Mecha Clash", False),
+    ("Frontier Z", False),
+    ("Hyper Drift", False),
+    ("Orbit Siege", False),
+]
+
+# Dark palette.
+BG = "#0B111E"          # window / canvas background
+WIDGET = "#121A2E"      # internal display widgets
+FG = "#E6EDF7"
+MUTED = "#5A6B86"
 GRID = "#1E2A44"
+ACCENT = "#1C7ED6"      # bright blue action button
 COLOR = {
     "optimal": "#2ECC71",
     "warning": "#E67E22",
@@ -44,174 +66,280 @@ COLOR = {
     "idle": "#5A6B86",
 }
 
-WINDOW_SAMPLES = 60   # rolling window for stats + sparkline
-PROBE_INTERVAL = 1.0  # seconds between probes
-PROBE_TIMEOUT = 1.5   # per-probe timeout (seconds)
+WINDOW_SAMPLES = 20     # rolling window for loss / stats
+PROBE_INTERVAL = 1.0    # seconds (refresh once per second, per spec)
+PROBE_TIMEOUT = 1.5
 
 
-class LatencyDashboard:
+class BoosterApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title(f"{__app_name__} {__version__}")
-        root.geometry("640x560")
-        root.minsize(560, 500)
-        root.configure(bg=CANVAS_BG)
+        root.geometry("820x560")
+        root.minsize(720, 520)
+        root.configure(bg=BG)
 
+        # Runtime state.
         self._queue: queue.Queue = queue.Queue()
-        self._worker: threading.Thread | None = None
-        self._stop = threading.Event()
+        self.engine: LatencyEngine | None = None
+        self.active_region: str | None = None
+        self.active_game: str | None = None
+        self.active_targets: list[tuple[str, int]] = []
         self._samples: list[float | None] = []
-        self.tracking = False
 
         self._init_style()
-        self._build_widgets()
+
+        # Stacked screens; switch with tkraise().
+        self.container = tk.Frame(root, bg=BG)
+        self.container.pack(fill=tk.BOTH, expand=True)
+        self.container.rowconfigure(0, weight=1)
+        self.container.columnconfigure(0, weight=1)
+
+        self.screen_catalog = tk.Frame(self.container, bg=BG)
+        self.screen_boost = tk.Frame(self.container, bg=BG)
+        for s in (self.screen_catalog, self.screen_boost):
+            s.grid(row=0, column=0, sticky="nsew")
+
+        self._build_catalog()
+        self._build_boost()
+        self._show(self.screen_catalog)
+
         self.root.after(80, self._drain_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---- theme ------------------------------------------------------------
     def _init_style(self) -> None:
         style = ttk.Style(self.root)
-        # 'clam' honours colour options on all platforms (unlike aqua/win themes).
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("Dark.TCombobox",
-                        fieldbackground=WIDGET_BG, background=WIDGET_BG,
-                        foreground=FG_TEXT, arrowcolor=FG_TEXT, bordercolor=GRID)
-        style.map("Dark.TCombobox",
-                  fieldbackground=[("readonly", WIDGET_BG)],
-                  foreground=[("readonly", FG_TEXT)])
-        style.configure("Track.TButton", background="#1C7ED6", foreground="#FFFFFF",
-                        bordercolor="#1C7ED6", focuscolor=WIDGET_BG, padding=8)
-        style.map("Track.TButton", background=[("active", "#1A6FBE")])
+        style.configure("Accent.TButton", background=ACCENT, foreground="#FFFFFF",
+                        bordercolor=ACCENT, focuscolor=WIDGET, padding=10,
+                        font=("Menlo", 12, "bold"))
+        style.map("Accent.TButton", background=[("active", "#1A6FBE")])
+        style.configure("Stop.TButton", background="#C0392B", foreground="#FFFFFF",
+                        bordercolor="#C0392B", focuscolor=WIDGET, padding=8)
+        style.map("Stop.TButton", background=[("active", "#A93226")])
+        style.configure("Region.TButton", background=WIDGET, foreground=FG,
+                        bordercolor=GRID, focuscolor=WIDGET, padding=10, anchor="w")
+        style.map("Region.TButton", background=[("active", "#1B2740")])
 
-    # ---- layout -----------------------------------------------------------
-    def _build_widgets(self) -> None:
-        pad = {"padx": 14}
+    def _show(self, frame: tk.Frame) -> None:
+        frame.tkraise()
 
-        header = tk.Label(self.root, text="LATENCYSCOPE  ·  ROUTE MONITOR",
-                          bg=CANVAS_BG, fg=FG_MUTED, font=("Menlo", 11, "bold"))
-        header.pack(anchor="w", pady=(12, 6), **pad)
+    # ---- Screen 1: catalog -----------------------------------------------
+    def _build_catalog(self) -> None:
+        s = self.screen_catalog
 
-        # Region selector row.
-        row = tk.Frame(self.root, bg=CANVAS_BG)
-        row.pack(fill=tk.X, **pad)
-        tk.Label(row, text="Target region", bg=CANVAS_BG, fg=FG_TEXT,
-                 font=("Menlo", 11)).pack(side=tk.LEFT)
-        self.var_region = tk.StringVar(value=next(iter(REGIONS)))
-        self.cmb_region = ttk.Combobox(row, textvariable=self.var_region,
-                                       values=list(REGIONS), state="readonly",
-                                       style="Dark.TCombobox", width=24)
-        self.cmb_region.pack(side=tk.LEFT, padx=10)
-        self.cmb_region.bind("<<ComboboxSelected>>", self._on_region_change)
+        header = tk.Frame(s, bg=BG)
+        header.pack(fill=tk.X, padx=18, pady=(16, 8))
+        tk.Label(header, text="LATENCYSCOPE  ·  BOOST CATALOG", bg=BG, fg=FG,
+                 font=("Menlo", 14, "bold")).pack(side=tk.LEFT)
 
-        self.btn_track = ttk.Button(row, text="▶  Start Tracking",
-                                    style="Track.TButton", command=self.toggle_tracking)
-        self.btn_track.pack(side=tk.RIGHT)
+        # Search bar, top-right of the header.
+        search_box = tk.Frame(header, bg=WIDGET, highlightthickness=1,
+                              highlightbackground=GRID)
+        search_box.pack(side=tk.RIGHT)
+        tk.Label(search_box, text="⌕", bg=WIDGET, fg=MUTED,
+                 font=("Menlo", 12)).pack(side=tk.LEFT, padx=(8, 2))
+        self.var_search = tk.StringVar()
+        self.var_search.trace_add("write", lambda *_: self._render_grid())
+        ent = tk.Entry(search_box, textvariable=self.var_search, width=22, bd=0,
+                       bg=WIDGET, fg=FG, insertbackground=FG, font=("Menlo", 11))
+        ent.pack(side=tk.LEFT, padx=(0, 8), pady=6)
 
-        # Live status label (colour-coded).
-        self.var_status = tk.StringVar(value="IDLE — SELECT A REGION AND START")
-        self.lbl_status = tk.Label(self.root, textvariable=self.var_status,
-                                   bg=WIDGET_BG, fg=COLOR["idle"],
-                                   font=("Menlo", 15, "bold"), pady=16)
-        self.lbl_status.pack(fill=tk.X, pady=14, **pad)
+        tk.Label(s, text="Select a game to boost", bg=BG, fg=MUTED,
+                 font=("Menlo", 10)).pack(anchor="w", padx=18)
 
-        # Big current-RTT readout.
-        panel = tk.Frame(self.root, bg=WIDGET_BG)
-        panel.pack(fill=tk.X, **pad)
-        self.var_rtt = tk.StringVar(value="-- ms")
-        tk.Label(panel, text="CURRENT RTT", bg=WIDGET_BG, fg=FG_MUTED,
-                 font=("Menlo", 10)).pack(anchor="w", padx=14, pady=(12, 0))
-        self.lbl_rtt = tk.Label(panel, textvariable=self.var_rtt, bg=WIDGET_BG,
-                                fg=FG_TEXT, font=("Menlo", 34, "bold"))
-        self.lbl_rtt.pack(anchor="w", padx=14, pady=(0, 10))
+        self.grid_frame = tk.Frame(s, bg=BG)
+        self.grid_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=10)
+        self._render_grid()
 
-        # Metrics strip.
-        strip = tk.Frame(self.root, bg=CANVAS_BG)
-        strip.pack(fill=tk.X, pady=(10, 0), **pad)
-        self._metric_vars: dict[str, tk.StringVar] = {}
-        for key, title in (("avg", "AVG"), ("min", "MIN"), ("max", "MAX"),
-                           ("jitter", "JITTER"), ("loss", "LOSS")):
-            cell = tk.Frame(strip, bg=WIDGET_BG)
-            cell.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=3)
-            tk.Label(cell, text=title, bg=WIDGET_BG, fg=FG_MUTED,
-                     font=("Menlo", 9)).pack(pady=(8, 0))
-            v = tk.StringVar(value="--")
-            self._metric_vars[key] = v
-            tk.Label(cell, textvariable=v, bg=WIDGET_BG, fg=FG_TEXT,
-                     font=("Menlo", 13, "bold")).pack(pady=(0, 8))
+    def _render_grid(self) -> None:
+        for w in self.grid_frame.winfo_children():
+            w.destroy()
+        query = self.var_search.get().strip().lower()
+        cols = 3
+        shown = [g for g in GAMES if query in g[0].lower()]
+        for c in range(cols):
+            self.grid_frame.columnconfigure(c, weight=1, uniform="cards")
+        for idx, (title, featured) in enumerate(shown):
+            r, c = divmod(idx, cols)
+            self._make_card(self.grid_frame, title, featured, r, c)
+        if not shown:
+            tk.Label(self.grid_frame, text="No games match your search.",
+                     bg=BG, fg=MUTED, font=("Menlo", 11)).grid(row=0, column=0,
+                                                               columnspan=cols, pady=30)
 
-        # Sparkline canvas.
-        tk.Label(self.root, text="LATENCY TIMELINE", bg=CANVAS_BG, fg=FG_MUTED,
-                 font=("Menlo", 9)).pack(anchor="w", pady=(14, 2), **pad)
-        self.canvas = tk.Canvas(self.root, bg=CANVAS_BG, height=130,
-                                highlightthickness=1, highlightbackground=GRID)
-        self.canvas.pack(fill=tk.BOTH, expand=True, pady=(0, 14), **pad)
+    def _make_card(self, parent, title: str, featured: bool, r: int, c: int) -> None:
+        border = ACCENT if featured else GRID
+        card = tk.Frame(parent, bg=WIDGET, highlightthickness=2,
+                        highlightbackground=border, cursor="hand2")
+        card.grid(row=r, column=c, sticky="nsew", padx=8, pady=8, ipady=6)
+        parent.rowconfigure(r, weight=1)
 
-    # ---- actions ----------------------------------------------------------
-    def toggle_tracking(self) -> None:
-        if self.tracking:
-            self._stop_tracking()
-        else:
-            self._start_tracking()
+        # Generic "cover art" placeholder block (colored rectangle, no real art).
+        art = tk.Frame(card, bg="#17213A", height=78)
+        art.pack(fill=tk.X, padx=10, pady=(10, 6))
+        tk.Label(art, text=title[:2].upper(), bg="#17213A",
+                 fg=ACCENT if featured else MUTED,
+                 font=("Menlo", 22, "bold")).pack(expand=True, pady=14)
 
-    def _start_tracking(self) -> None:
-        # Requirement: clear old data cleanly on each (re)start.
-        self._clear_data()
-        region = self.var_region.get()
-        host, port = REGIONS[region]
+        tk.Label(card, text=title, bg=WIDGET, fg=FG,
+                 font=("Menlo", 12, "bold")).pack(anchor="w", padx=10)
+        tk.Label(card, text="★ Featured" if featured else "Ready to boost",
+                 bg=WIDGET, fg=(ACCENT if featured else MUTED),
+                 font=("Menlo", 9)).pack(anchor="w", padx=10, pady=(0, 10))
 
-        self._stop.clear()
-        self.tracking = True
-        self.btn_track.config(text="■  Stop Tracking")
-        self.cmb_region.config(state="disabled")
-        self.var_status.set(f"TRACKING {region} …")
-        self.lbl_status.config(fg=COLOR["idle"])
+        # Whole card is clickable -> opens the server-selection modal.
+        for widget in (card, art, *card.winfo_children(), *art.winfo_children()):
+            widget.bind("<Button-1>", lambda _e, t=title: self._open_region_modal(t))
 
-        self._worker = threading.Thread(
-            target=self._run_probe_loop, args=(host, port), daemon=True)
-        self._worker.start()
+    # ---- Screen 2: server-selection modal --------------------------------
+    def _open_region_modal(self, game: str) -> None:
+        modal = tk.Toplevel(self.root, bg=WIDGET)
+        modal.title(f"Select server — {game}")
+        modal.configure(highlightthickness=1, highlightbackground=ACCENT)
+        modal.transient(self.root)
+        modal.resizable(False, False)
 
-    def _stop_tracking(self) -> None:
-        self._stop.set()
-        self.tracking = False
-        self.btn_track.config(text="▶  Start Tracking")
-        self.cmb_region.config(state="readonly")
-        self.var_status.set("STOPPED")
-        self.lbl_status.config(fg=COLOR["idle"])
+        tk.Label(modal, text=f"{game}", bg=WIDGET, fg=FG,
+                 font=("Menlo", 15, "bold")).pack(anchor="w", padx=20, pady=(18, 2))
+        tk.Label(modal, text="Choose a server region", bg=WIDGET, fg=MUTED,
+                 font=("Menlo", 10)).pack(anchor="w", padx=20, pady=(0, 12))
 
-    def _on_region_change(self, _event=None) -> None:
-        # Switching region resets the view; user clicks Start to begin afresh.
-        if self.tracking:
-            self._stop_tracking()
-        self._clear_data()
-        self.var_status.set("IDLE — SELECT A REGION AND START")
-        self.lbl_status.config(fg=COLOR["idle"])
+        for region in REGION_ENDPOINTS:
+            ttk.Button(modal, text=f"   {region}", style="Region.TButton", width=30,
+                       command=lambda rg=region: self._choose_region(game, rg, modal)
+                       ).pack(fill=tk.X, padx=20, pady=4)
 
-    def _clear_data(self) -> None:
+        ttk.Button(modal, text="Cancel", style="Region.TButton",
+                   command=modal.destroy).pack(fill=tk.X, padx=20, pady=(12, 18))
+
+        # Center the modal over the main window and make it modal.
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - 360) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - 420) // 2
+        modal.geometry(f"360x440+{max(x, 0)}+{max(y, 0)}")
+        modal.grab_set()
+
+    def _choose_region(self, game: str, region: str, modal: tk.Toplevel) -> None:
+        # Record the target destination array for the chosen region.
+        self.active_game = game
+        self.active_region = region
+        self.active_targets = list(REGION_ENDPOINTS[region])
+        modal.destroy()
+        self._enter_boost()
+
+    # ---- Screen 3: boost dashboard (split) -------------------------------
+    def _build_boost(self) -> None:
+        s = self.screen_boost
+        s.columnconfigure(0, weight=1, uniform="half")
+        s.columnconfigure(1, weight=1, uniform="half")
+        s.rowconfigure(0, weight=1)
+
+        # Left: control panel.
+        left = tk.Frame(s, bg=WIDGET)
+        left.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=16)
+
+        self.boost_art = tk.Frame(left, bg="#17213A", height=120)
+        self.boost_art.pack(fill=tk.X, padx=16, pady=16)
+        self.var_game = tk.StringVar(value="—")
+        tk.Label(self.boost_art, textvariable=self.var_game, bg="#17213A", fg=ACCENT,
+                 font=("Menlo", 20, "bold")).pack(expand=True, pady=28)
+
+        tk.Label(left, text="TARGET SERVER", bg=WIDGET, fg=MUTED,
+                 font=("Menlo", 9)).pack(anchor="w", padx=16, pady=(6, 0))
+        self.var_region = tk.StringVar(value="—")
+        tk.Label(left, textvariable=self.var_region, bg=WIDGET, fg=FG,
+                 font=("Menlo", 15, "bold")).pack(anchor="w", padx=16)
+        self.var_endpoint = tk.StringVar(value="")
+        tk.Label(left, textvariable=self.var_endpoint, bg=WIDGET, fg=MUTED,
+                 font=("Menlo", 9)).pack(anchor="w", padx=16, pady=(2, 0))
+
+        ttk.Button(left, text="■  Disconnect / Stop Boost", style="Stop.TButton",
+                   command=self._stop_boost).pack(side=tk.BOTTOM, fill=tk.X,
+                                                  padx=16, pady=16)
+
+        # Right: telemetry.
+        right = tk.Frame(s, bg=WIDGET)
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=16)
+
+        ttk.Button(right, text="▶  Launch Game", style="Accent.TButton",
+                   command=self._launch_game).pack(fill=tk.X, padx=16, pady=16)
+
+        tk.Label(right, text="LIVE TELEMETRY", bg=WIDGET, fg=MUTED,
+                 font=("Menlo", 9)).pack(anchor="w", padx=16)
+
+        tiles = tk.Frame(right, bg=WIDGET)
+        tiles.pack(fill=tk.X, padx=12, pady=8)
+        self.var_ping = tk.StringVar(value="-- ms")
+        self.var_loss = tk.StringVar(value="-- %")
+        self.lbl_ping = self._make_tile(tiles, "LIVE PING", self.var_ping, 0)
+        self.lbl_loss = self._make_tile(tiles, "PACKET LOSS", self.var_loss, 1)
+
+        self.var_route = tk.StringVar(value="IDLE")
+        self.lbl_route = tk.Label(right, textvariable=self.var_route, bg=WIDGET,
+                                  fg=COLOR["idle"], font=("Menlo", 13, "bold"), pady=12)
+        self.lbl_route.pack(fill=tk.X, padx=16, pady=(8, 0))
+
+    def _make_tile(self, parent, title: str, var: tk.StringVar, col: int) -> tk.Label:
+        parent.columnconfigure(col, weight=1)
+        cell = tk.Frame(parent, bg=BG, highlightthickness=1, highlightbackground=GRID)
+        cell.grid(row=0, column=col, sticky="nsew", padx=4)
+        tk.Label(cell, text=title, bg=BG, fg=MUTED,
+                 font=("Menlo", 9)).pack(pady=(14, 2))
+        value = tk.Label(cell, textvariable=var, bg=BG, fg=FG,
+                         font=("Menlo", 26, "bold"))
+        value.pack(pady=(0, 16))
+        return value
+
+    def _enter_boost(self) -> None:
+        self._reset_telemetry()
+        self.var_game.set(self.active_game or "—")
+        self.var_region.set(self.active_region or "—")
+        host, port = self.active_targets[0]
+        self.var_endpoint.set(f"{host}:{port}")
+        self.var_route.set("CONNECTING …")
+        self.lbl_route.config(fg=COLOR["idle"])
+        self._show(self.screen_boost)
+
+        # Start the live engine for the chosen region's target array.
+        self.engine = LatencyEngine(self.active_targets, interval=PROBE_INTERVAL,
+                                    timeout=PROBE_TIMEOUT)
+        self.engine.start(self._on_sample)
+
+    def _stop_boost(self) -> None:
+        self._shutdown_engine()
+        self._reset_telemetry()
+        self._show(self.screen_catalog)
+
+    def _launch_game(self) -> None:
+        # No real game is bundled; this is a labelled placeholder, not an
+        # arbitrary process launcher.
+        messagebox.showinfo(
+            __app_name__,
+            f"No game executable is configured for '{self.active_game}'.\n"
+            "LatencyScope measures route latency; it does not launch or tunnel games.")
+
+    # ---- engine callback + telemetry -------------------------------------
+    def _on_sample(self, rtt: float | None) -> None:
+        # Called on the engine thread; hand off to the UI thread via the queue.
+        self._queue.put(rtt)
+
+    def _reset_telemetry(self) -> None:
         self._samples.clear()
-        # Drain any stale samples still queued from a previous run.
         try:
             while True:
                 self._queue.get_nowait()
         except queue.Empty:
             pass
-        self.var_rtt.set("-- ms")
-        self.lbl_rtt.config(fg=FG_TEXT)
-        for v in self._metric_vars.values():
-            v.set("--")
-        self.canvas.delete("all")
+        self.var_ping.set("-- ms")
+        self.var_loss.set("-- %")
+        self.lbl_ping.config(fg=FG)
+        self.lbl_loss.config(fg=FG)
 
-    # ---- worker -----------------------------------------------------------
-    def _run_probe_loop(self, host: str, port: int) -> None:
-        while not self._stop.is_set():
-            rtt = probes.tcp_ping(host, port, timeout=PROBE_TIMEOUT)
-            if self._stop.is_set():
-                break
-            self._queue.put(rtt)
-            self._stop.wait(PROBE_INTERVAL)  # interruptible sleep
-
-    # ---- UI pump ----------------------------------------------------------
     def _drain_queue(self) -> None:
         updated = False
         try:
@@ -224,86 +352,43 @@ class LatencyDashboard:
         except queue.Empty:
             pass
         if updated:
-            self._refresh()
+            self._refresh_telemetry()
         self.root.after(80, self._drain_queue)
 
-    def _refresh(self) -> None:
+    def _refresh_telemetry(self) -> None:
         st = compute_stats(self._samples)
         last = self._samples[-1] if self._samples else None
 
-        # Current RTT readout, coloured by the per-sample threshold.
         if last is None:
-            self.var_rtt.set("timeout")
-            self.lbl_rtt.config(fg=COLOR["critical"])
+            self.var_ping.set("timeout")
+            self.lbl_ping.config(fg=COLOR["critical"])
         else:
-            self.var_rtt.set(f"{last:.0f} ms")
-            self.lbl_rtt.config(fg=COLOR["warning"] if last > RTT_WARN_MS else COLOR["optimal"])
+            self.var_ping.set(f"{last:.0f} ms")
+            self.lbl_ping.config(
+                fg=COLOR["warning"] if last > RTT_WARN_MS else COLOR["optimal"])
 
-        # Metrics.
-        self._metric_vars["avg"].set(f"{st.avg_ms:.0f}" if st.avg_ms is not None else "--")
-        self._metric_vars["min"].set(f"{st.min_ms:.0f}" if st.min_ms is not None else "--")
-        self._metric_vars["max"].set(f"{st.max_ms:.0f}" if st.max_ms is not None else "--")
-        self._metric_vars["jitter"].set(f"{st.jitter_ms:.0f}" if st.jitter_ms is not None else "--")
-        self._metric_vars["loss"].set(f"{st.loss_pct:.0f}%")
+        self.var_loss.set(f"{st.loss_pct:.0f} %")
+        self.lbl_loss.config(
+            fg=COLOR["warning"] if st.loss_pct >= 5.0 else COLOR["optimal"])
 
-        # Colour-coded live status label.
         message, severity = route_status(st)
-        self.var_status.set(message)
-        self.lbl_status.config(fg=COLOR[severity])
+        self.var_route.set(message)
+        self.lbl_route.config(fg=COLOR[severity])
 
-        self._draw_sparkline()
+    # ---- lifecycle --------------------------------------------------------
+    def _shutdown_engine(self) -> None:
+        if self.engine is not None:
+            self.engine.stop()
+            self.engine = None
 
-    def _draw_sparkline(self) -> None:
-        c = self.canvas
-        c.delete("all")
-        w = c.winfo_width() or 600
-        h = c.winfo_height() or 130
-        pad = 8
-        plot_h = h - 2 * pad
-
-        received = [s for s in self._samples if s is not None]
-        y_max = max(RTT_WARN_MS * 1.3, max(received) * 1.15 if received else RTT_WARN_MS)
-
-        def y_of(ms: float) -> float:
-            return pad + plot_h * (1.0 - min(ms, y_max) / y_max)
-
-        # 130ms warning threshold line.
-        ty = y_of(RTT_WARN_MS)
-        c.create_line(pad, ty, w - pad, ty, fill=COLOR["warning"], dash=(4, 3))
-        c.create_text(w - pad - 2, ty - 8, text=f"{RTT_WARN_MS:.0f}ms", anchor="e",
-                      fill=COLOR["warning"], font=("Menlo", 8))
-
-        if len(self._samples) < 2:
-            return
-
-        n = len(self._samples)
-        step = (w - 2 * pad) / max(1, n - 1)
-        pts: list[tuple[float, float, bool]] = []
-        for i, s in enumerate(self._samples):
-            x = pad + i * step
-            if s is None:
-                # Mark a loss with a short red tick at the baseline.
-                c.create_line(x, h - pad, x, h - pad - 10, fill=COLOR["critical"])
-                pts.append((x, h - pad, False))
-            else:
-                pts.append((x, y_of(s), True))
-
-        # Draw the line only across consecutive received samples.
-        run: list[tuple[float, float]] = []
-        for x, y, ok in pts:
-            if ok:
-                run.append((x, y))
-            else:
-                if len(run) >= 2:
-                    c.create_line(*[v for xy in run for v in xy], fill=COLOR["optimal"], width=2)
-                run = []
-        if len(run) >= 2:
-            c.create_line(*[v for xy in run for v in xy], fill=COLOR["optimal"], width=2)
+    def _on_close(self) -> None:
+        self._shutdown_engine()
+        self.root.destroy()
 
 
 def launch() -> None:
     root = tk.Tk()
-    LatencyDashboard(root)
+    BoosterApp(root)
     root.mainloop()
 
 
