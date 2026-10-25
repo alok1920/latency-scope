@@ -122,8 +122,12 @@ def icmp_ping(host: str, *, timeout: float = 1.0, sequence: int = 1,
     except PermissionError:
         raise
     except OSError as exc:
-        if exc.errno in (getattr(socket.errno, "EPERM", 1),
-                         getattr(socket.errno, "EACCES", 13)):
+        # Access denied -> raw sockets need elevation. Covers POSIX EPERM/EACCES
+        # and Windows WSAEACCES (10013), which Python does not map to
+        # PermissionError and which surfaces via errno and/or winerror.
+        access_denied = {getattr(socket.errno, "EPERM", 1),
+                         getattr(socket.errno, "EACCES", 13), 10013}
+        if exc.errno in access_denied or getattr(exc, "winerror", None) == 10013:
             raise PermissionError("raw ICMP socket requires elevated privileges") from exc
         raise ProbeError(f"cannot open ICMP socket: {exc}") from exc
 

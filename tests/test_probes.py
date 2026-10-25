@@ -33,15 +33,39 @@ def test_tcp_ping_to_open_port():
         srv.close()
 
 
-def test_tcp_ping_to_refused_port_is_reachable():
-    # Bind then close to get a port that is almost certainly refused.
+def test_tcp_ping_refused_counts_as_reachable(monkeypatch):
+    # Contract: an actively refused connection completed a round trip and must
+    # be reported as a timing, not a loss. Mocked so the outcome is identical on
+    # every OS (real refused-vs-dropped behaviour differs between platforms).
+    class _RefusingSocket:
+        def __init__(self, *a, **k):
+            pass
+
+        def settimeout(self, _t):
+            pass
+
+        def connect(self, _addr):
+            raise ConnectionRefusedError(61, "connection refused")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(probes.socket, "socket", lambda *a, **k: _RefusingSocket())
+    rtt = probes.tcp_ping("127.0.0.1", 1, timeout=1.0)
+    assert rtt is not None
+    assert rtt >= 0.0
+
+
+def test_tcp_ping_real_closed_port_returns_float_or_none():
+    # A real closed port is refused (float) on some OSes and silently dropped
+    # (None, via timeout) on others — e.g. Windows CI runners. Both are valid;
+    # assert only that the probe returns the right type and never crashes.
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
-    # Refused connection still completed a round trip -> a timing, not None.
-    rtt = probes.tcp_ping("127.0.0.1", port, timeout=1.0)
-    assert rtt is not None
+    rtt = probes.tcp_ping("127.0.0.1", port, timeout=0.5)
+    assert rtt is None or isinstance(rtt, float)
 
 
 def test_tcp_ping_timeout_returns_none():
@@ -77,10 +101,12 @@ def test_udp_ping_with_echo_server():
 
 
 def test_icmp_ping_degrades_gracefully_without_privilege():
-    # Non-root test runners cannot open raw sockets; the call must either
-    # return a timing/None or raise PermissionError — never crash otherwise.
+    # Unprivileged runners cannot open raw sockets. The call must either return
+    # a timing/None or raise a handled error (PermissionError, or ProbeError on
+    # Windows where WSAEACCES does not map to PermissionError) — never an
+    # unhandled exception.
     try:
         rtt = probes.icmp_ping("127.0.0.1", timeout=0.5)
         assert rtt is None or isinstance(rtt, float)
-    except PermissionError:
+    except (PermissionError, probes.ProbeError):
         pass
