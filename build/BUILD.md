@@ -22,10 +22,12 @@ pyinstaller build\latencyscope.spec
 Output: `dist\LatencyScope.exe` — a single file, launches the GUI with **no
 console window** (the spec sets `console=False`, i.e. `--windowed`).
 
-Equivalent one-liner without the spec file:
+Equivalent one-liner without the spec file (note: the entry point is `app.py`,
+**not** `latencyscope\__main__.py` — a package module used as PyInstaller's entry
+cannot do its relative imports):
 
 ```bat
-pyinstaller --onefile --windowed --name LatencyScope latencyscope\__main__.py
+pyinstaller --onefile --windowed --name LatencyScope app.py
 ```
 
 ### Notes for the Windows build

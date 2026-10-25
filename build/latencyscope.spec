@@ -19,7 +19,9 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 block_cipher = None
 
 a = Analysis(
-    [os.path.join(PROJECT_ROOT, 'latencyscope', '__main__.py')],
+    # Entry point lives OUTSIDE the package and uses absolute imports, so it
+    # works when PyInstaller runs it as the top-level __main__ module.
+    [os.path.join(PROJECT_ROOT, 'app.py')],
     pathex=[PROJECT_ROOT],
     binaries=[],
     datas=[],
