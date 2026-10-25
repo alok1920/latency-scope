@@ -1,0 +1,90 @@
+name: Build Windows EXE
+
+# Builds LatencyScope into a single-file Windows .exe on a Windows runner
+# (PyInstaller cannot cross-compile, so this must run on windows-latest).
+#
+# Assumes the repository ROOT is the LatencyScope project — i.e. it contains
+# `latencyscope/`, `build/latencyscope.spec`, `pyproject.toml` and `tests/`.
+# If the project instead lives in a subfolder, set `PROJECT_DIR` below to that
+# folder (e.g. "latencyscope") and the steps will cd into it.
+
+on:
+  # Manual run from the Actions tab in your browser.
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Also publish the EXE as a GitHub Release (PUBLIC if the repo is public)"
+        type: boolean
+        default: false
+  # Pushing a version tag (e.g. v1.0.0) builds AND publishes a Release.
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # required only for creating a Release; artifacts need no extra perms
+
+env:
+  PROJECT_DIR: .    # set to "latencyscope" if the project is in a subfolder
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_DIR }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pytest
+          # LatencyScope has no third-party runtime deps, but honour a
+          # requirements file if one is ever added.
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Build single-file EXE
+        run: pyinstaller --clean --noconfirm build/latencyscope.spec
+
+      - name: Verify the EXE exists
+        run: |
+          if (-not (Test-Path dist/LatencyScope.exe)) {
+            Write-Error "dist/LatencyScope.exe was not produced"
+            exit 1
+          }
+          Get-Item dist/LatencyScope.exe | Format-List Name, Length, LastWriteTime
+
+      # Always available: downloadable from the workflow run page in a browser.
+      - name: Upload EXE as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LatencyScope-windows-exe
+          path: ${{ env.PROJECT_DIR }}/dist/LatencyScope.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      # Opt-in only: runs on a tag push, or when you tick "create_release".
+      - name: Publish EXE as a GitHub Release
+        if: >-
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.create_release)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.PROJECT_DIR }}/dist/LatencyScope.exe
+          # For a manual run (no tag), publish under a predictable tag name.
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'manual-build' }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || 'LatencyScope manual build' }}
+          generate_release_notes: ${{ github.ref_type == 'tag' }}

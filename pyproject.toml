@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "latencyscope"
+version = "1.0.0"
+description = "Standalone multi-protocol (ICMP/TCP/UDP) game-latency, jitter and packet-loss analyzer."
+readme = "README.md"
+requires-python = ">=3.10"
+# Runtime uses only the Python standard library (socket, struct, tkinter, ...).
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pyinstaller>=6"]
+
+[project.scripts]
+latencyscope = "latencyscope.cli:main"
+
+[project.gui-scripts]
+latencyscope-gui = "latencyscope.gui:launch"
+
+[tool.setuptools.packages.find]
+include = ["latencyscope*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
